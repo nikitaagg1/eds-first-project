@@ -1,0 +1,469 @@
+package com.xyz.shop.core.service.impl;
+
+import static com.xyz.shop.core.constants.Constants.DOT;
+import static com.xyz.shop.core.constants.Constants.FILTER_PRODUCTS_BY_MODEL_CODE;
+import static com.xyz.shop.core.constants.Constants.FITLER_PRODUCTS_BY_LTO;
+import static com.xyz.shop.core.constants.Constants.NULL;
+import static com.xyz.shop.core.constants.Constants.PDP_SELECTOR;
+import static com.xyz.shop.core.constants.Constants.PRODUCT_API_DEFAULT_LIMIT;
+import static com.xyz.shop.core.constants.Constants.RESULTS;
+import static com.xyz.shop.core.constants.Constants.SORT_BY_PRODUCTS_FILTER;
+import static com.xyz.shop.core.constants.Constants.SUCCESS_MSG;
+import static com.xyz.shop.core.constants.Constants.ZERO;
+import static com.xyz.shop.core.utilities.OneShopResponseUtil.setProductDetails;
+import static javax.servlet.http.HttpServletResponse.SC_OK;
+import static org.apache.sling.api.servlets.HttpConstants.METHOD_GET;
+
+import java.io.UnsupportedEncodingException;
+import java.net.URLEncoder;
+import java.text.MessageFormat;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+import org.apache.commons.collections4.CollectionUtils;
+import org.apache.commons.lang3.ObjectUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.apache.sling.api.resource.Resource;
+import org.apache.sling.api.resource.ResourceResolver;
+import org.apache.sling.api.resource.ValueMap;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Reference;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import com.adobe.cq.dam.cfm.ContentElement;
+import com.adobe.cq.dam.cfm.ContentFragment;
+import com.adobe.granite.crypto.CryptoException;
+import com.adobe.granite.crypto.CryptoSupport;
+import com.xyz.shop.core.caffeine.ProductCategoriesCacheStore;
+import com.xyz.shop.core.caffeine.ProductCategoriesDataStore;
+import com.xyz.shop.core.config.OneShopApiConfigurationService;
+import com.xyz.shop.core.constants.Constants;
+import com.xyz.shop.core.exception.GenericException;
+import com.xyz.shop.core.models.impl.bean.ProductDetails;
+import com.xyz.shop.core.models.impl.bean.ProductListingApiResponse;
+import com.xyz.shop.core.models.impl.bean.ProductListingApiStatusResponse;
+import com.xyz.shop.core.service.OneShopService;
+import com.xyz.shop.core.service.ProductListingService;
+import com.xyz.shop.core.service.beans.RestServiceConfiguration;
+import com.xyz.shop.core.utilities.GlobalUtil;
+import com.xyz.shop.core.utilities.JsonPathQuery;
+import com.xyz.shop.core.utilities.JsonUtil;
+import com.xyz.shop.core.utilities.RestServiceRequest;
+import com.day.cq.commons.jcr.JcrConstants;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+
+import net.minidev.json.JSONArray;
+
+@Component(service = TestService.class, immediate = true, enabled = true)
+public class TestServiceImpl implements TestService {
+
+    private static final Logger LOG = LoggerFactory.getLogger(ProductListingServiceImpl.class);
+
+    @Reference
+    OneShopService oneShopService;
+
+    @Reference
+    CryptoSupport cryptoSupport;
+
+    @Reference
+    OneShopApiConfigurationService oneShopApiConfig;
+
+    @Reference
+    ProductCategoriesCacheStore cacheStore;
+
+    @Override
+    public ProductListingApiResponse fetchProductList(final Map<String, String> paramMap, final int limit,
+            final int offset, final String brand) throws GenericException {
+
+        LOG.debug("Inside fetchProductList method");
+        final JsonObject serviceResponse = getProducts(paramMap.get(Constants.CATEGORY),
+                paramMap.get(Constants.MODEL_CODE), paramMap.get(Constants.LTO), limit, offset,
+                paramMap.get(Constants.SORT_BY_FLAG), brand);
+        return setProductListingResponse(paramMap.get(Constants.DEALER_CODE), serviceResponse, brand);
+
+    }
+
+    /**
+     * This method will set the product search API response.
+     */
+    @Override
+    public ProductListingApiResponse fetchProductSearchResults(final Map<String, String> paramMap, final int limit,
+            final int offset, final int fuzzyLevel, final String brand) throws GenericException {
+
+        LOG.debug("Inside fetchProductSearchResults method");
+        ProductListingApiResponse productListingApiResponse = new ProductListingApiResponse();
+
+        try {
+            final RestServiceConfiguration serviceConfig = getServiceConfig(brand);
+            final StringBuilder serviceEndpoint = new StringBuilder();
+            String productProjectionEndpoint = StringUtils.EMPTY;
+            if (StringUtils.isNoneEmpty(paramMap.get(Constants.PRODUCT_PART_NUMBER))) {
+                productProjectionEndpoint = MessageFormat.format(
+                        GlobalUtil.getConfig(brand, oneShopApiConfig.getSearchByPartNumberUrl()),
+                        URLEncoder.encode(paramMap.get(Constants.PRODUCT_PART_NUMBER), Constants.UTF_8), limit, offset);
+            } else if (StringUtils.isNoneEmpty(paramMap.get(Constants.KEYWORD))) {
+                productProjectionEndpoint = MessageFormat.format(
+                        GlobalUtil.getConfig(brand, oneShopApiConfig.getSearchByTextUrl()),
+                        URLEncoder.encode(paramMap.get(Constants.KEYWORD), Constants.UTF_8),
+                        paramMap.get(Constants.FUZZY), fuzzyLevel, limit, offset);
+            }
+            LOG.debug("Product Projection Endpoint URL {}", productProjectionEndpoint);
+            serviceEndpoint.append(productProjectionEndpoint);
+            serviceConfig.setServiceEndpoint(serviceEndpoint.toString());
+
+            final RestServiceRequest request = new RestServiceRequest(serviceConfig);
+            final JsonObject serviceResponse = oneShopService.executeOneShopGetRequest(request, brand);
+            productListingApiResponse = setProductListingResponse(paramMap.get(Constants.DEALER_CODE), serviceResponse,
+                    brand);
+
+        } catch (final CryptoException | UnsupportedEncodingException cryptoException) {
+            throw new GenericException("Crypto Exception while getting products search results", cryptoException);
+        }
+        return productListingApiResponse;
+    }
+
+    /**
+     * This method will get ancestors tree length for a category.
+     *
+     * @param category
+     * @param serviceResponse
+     *            - response from OneShop for categories
+     *
+     * @return length of ancestor tree.
+     */
+    public int getAncestorTreeLength(final String category, final JsonObject serviceResponse) {
+
+        int length = 0;
+        final JSONArray ancestorJSONArray = JsonUtil.getArrayValueFromJson(serviceResponse,
+                String.format(JsonPathQuery.GET_ANCESTOR_TREE.query(), category));
+        if (!Objects.isNull(ancestorJSONArray)) {
+            length = ancestorJSONArray.size();
+        }
+
+        return length;
+
+    }
+
+    /**
+     * This method will get breadcrumb from category
+     *
+     * @param categories
+     * @param resovler
+     *
+     * @return breadcrumb list
+     */
+    @Override
+    public List<Map<String, String>> getBreadCrumbFromCategory(final List<String> categories,
+            final ResourceResolver resolver, final String brand) throws GenericException {
+
+        try {
+
+            JsonObject categoriesResponse = new JsonObject();
+            if (!Objects.isNull(cacheStore.getCache(brand))) {
+
+                if (!Objects.isNull(cacheStore.getCache(brand).getIfPresent(Constants.PRODUCT_CATGORIES_CACHE))) {
+                    categoriesResponse = cacheStore.getCache(brand).getIfPresent(Constants.PRODUCT_CATGORIES_CACHE)
+                            .getCategoriesMasterObject();
+                } else {
+                    final ProductCategoriesDataStore productCategoriesDataStore = new ProductCategoriesDataStore();
+                    categoriesResponse = getCategoriesFromOneShop(brand);
+                    productCategoriesDataStore.setCategoriesMasterObject(categoriesResponse);
+                    cacheStore.getCache(brand).put(Constants.PRODUCT_CATGORIES_CACHE, productCategoriesDataStore);
+                }
+            } else {
+                categoriesResponse = getCategoriesFromOneShop(brand);
+            }
+
+            final String[] categoriesArray = categories.toArray(new String[0]);
+            int shortestAncestorTreeCategoryIndex = 0;
+            int ancestorTreeLength = getAncestorTreeLength(categoriesArray[0], categoriesResponse);
+            if (categoriesArray.length > 1) {
+                for (int count = 1; count < categoriesArray.length; count++) {
+                    final int length = getAncestorTreeLength(categoriesArray[count], categoriesResponse);
+                    if (length < ancestorTreeLength) {
+                        ancestorTreeLength = length;
+                        shortestAncestorTreeCategoryIndex = count;
+                    }
+                }
+            }
+            final List<String> ancestorCategories = JsonUtil.getListFromJson(categoriesResponse, String.format(
+                    JsonPathQuery.GET_ANCESTOR_TREE.query(), categoriesArray[shortestAncestorTreeCategoryIndex]));
+            // removing first category as that is base category such as US_BF-Accessory or
+            // US_Lifestyle
+            ancestorCategories.remove(0);
+            ancestorCategories.add(categoriesArray[shortestAncestorTreeCategoryIndex]);
+            return getBreadcrumbJson(ancestorCategories, resolver, brand);
+        } catch (final CryptoException exception) {
+            throw new GenericException("Crypto Exception while getting products count for categories", exception);
+        }
+    }
+
+    /**
+     * This method will get categories sub tree
+     *
+     * @param categoryId
+     * @param serviceResponse
+     *            - response from OneShop for all categories/subcategories
+     * @param lastLevelCategory
+     *
+     * @return list of categories subtree
+     */
+    @Override
+    public List<String> getCategoriesSubtree(String categoryId, final JsonObject serviceResponse,
+            final boolean lastLevelCategory) {
+
+        List<String> childList = new ArrayList<>();
+        if (lastLevelCategory) {
+            categoryId = JsonUtil
+                    .getArrayValueFromJson(serviceResponse, String.format(JsonPathQuery.GET_PARENT.query(), categoryId))
+                    .get(0).toString();
+        }
+        childList.add(categoryId);
+        childList = Stream
+                .concat(childList.stream(),
+                        JsonUtil.getListFromJson(serviceResponse,
+                                String.format(JsonPathQuery.GET_FIRST_LEVEL_CHILD.query(), categoryId)).stream())
+                .collect(Collectors.toList());
+
+        return childList;
+    }
+
+    /**
+     * This method will fetch mapping of category image and category page path from
+     * content fragment
+     *
+     * @param resourceResolver
+     *
+     * @return categoryjsonmapping
+     */
+    @Override
+    public String getCategoryJsonMapping(final ResourceResolver resolver, final String brand) {
+
+        String content = StringUtils.EMPTY;
+        final Resource fragmentResource = (resolver
+                .getResource(GlobalUtil.getConfig(brand, oneShopApiConfig.categoryJsonMapping())));
+        if (fragmentResource != null) {
+            final ContentFragment fragment = fragmentResource.adaptTo(ContentFragment.class);
+            final Iterator<ContentElement> elements = fragment.getElements();
+            while (elements.hasNext()) {
+                final ContentElement element = elements.next();
+                content = element.getContent();
+            }
+        }
+        return content;
+
+    }
+
+    /**
+     * This method will get child categories till nth level
+     *
+     * @param parentCategoryId
+     * @param serviceResponse
+     *            - response from OneShop for all categories/subcategories
+     *
+     * @return list of child categories
+     */
+    @Override
+    public List<String> getChildCategories(final String parentCategoryId, final JsonObject serviceResponse) {
+
+        return JsonUtil.getListFromJson(serviceResponse,
+                String.format(JsonPathQuery.GET_ALL_CHILD_CATEGORIES.query(), parentCategoryId));
+
+    }
+
+    /**
+     * This method will get products from product projections service from OneShop
+     *
+     * @param parentCategoryId
+     * @param modelCode
+     * @param lto
+     * @param limit
+     * @param offset
+     *
+     * @return response from OneShop
+     */
+    @Override
+    public JsonObject getProducts(final String parentCategoryId, final String modelCode, final String lto,
+            final int limit, final int offset, final String sortByFlag, final String brand) throws GenericException {
+
+        try {
+            final RestServiceConfiguration serviceConfig = getServiceConfig(brand);
+
+            final StringBuilder serviceEndpoint = new StringBuilder();
+            final String productProjectionEndpoint = MessageFormat.format(
+                    GlobalUtil.getConfig(brand, oneShopApiConfig.getProductsByCategoryModelCode()), limit, offset,
+                    parentCategoryId);
+            serviceEndpoint.append(productProjectionEndpoint);
+            if ((StringUtils.isNotEmpty(modelCode)) && (!modelCode.equals(NULL))) {
+                serviceEndpoint.append(MessageFormat.format(FILTER_PRODUCTS_BY_MODEL_CODE, modelCode));
+            }
+            if ((StringUtils.isNotEmpty(lto)) && (!lto.equals(NULL)) && "true".equalsIgnoreCase(lto)) {
+                serviceEndpoint.append(FITLER_PRODUCTS_BY_LTO);
+            }
+            if ((StringUtils.isNotEmpty(sortByFlag)) && (!sortByFlag.equals(NULL))
+                    && (!sortByFlag.equals("undefined"))) {
+                final String sortQuery = URLEncoder.encode(sortByFlag.replace(DOT, PDP_SELECTOR), Constants.UTF_8);
+                serviceEndpoint.append(MessageFormat.format(SORT_BY_PRODUCTS_FILTER, sortQuery));
+            }
+            serviceConfig.setServiceEndpoint(serviceEndpoint.toString());
+
+            final RestServiceRequest request = new RestServiceRequest(serviceConfig);
+            return oneShopService.executeOneShopGetRequest(request, brand);
+        } catch (final CryptoException | UnsupportedEncodingException cryptoException) {
+            throw new GenericException("Crypto Exception while getting products count for categories", cryptoException);
+        }
+    }
+
+    /**
+     * This method will get products count from product projections service from
+     * OneShop
+     *
+     * @param categoriesSubtree
+     * @param modelCode
+     * @param lto
+     * @param lastLevelCategory
+     *
+     * @return response for products count for each category
+     */
+    @Override
+    public JsonObject getProductsCount(final List<String> categoriesSubtree, final String modelCode, final String lto,
+            final boolean lastLevelCategory, final String brand) throws GenericException {
+
+        final JsonObject productCountJson = new JsonObject();
+        for (final String category : categoriesSubtree) {
+            final JsonObject serviceResponse = getProducts(category, modelCode, lto, PRODUCT_API_DEFAULT_LIMIT, ZERO,
+                    NULL, brand);
+            if (!serviceResponse.isJsonNull()) {
+                final int productsCount = JsonUtil.getIntValueFromJson(serviceResponse,
+                        JsonPathQuery.PRODUCTS_TOTAL.query());
+                productCountJson.addProperty(category, productsCount);
+            }
+        }
+        return productCountJson;
+    }
+
+    /**
+     * This method will return RestServiceConfiguration object.
+     *
+     * @return
+     */
+    public RestServiceConfiguration getServiceConfig(final String brand) throws CryptoException {
+
+        final RestServiceConfiguration serviceConfig = new RestServiceConfiguration();
+        serviceConfig.setXApiKey(cryptoSupport.isProtected(GlobalUtil.getConfig(brand, oneShopApiConfig.getApiKey()))
+                ? cryptoSupport.unprotect(GlobalUtil.getConfig(brand, oneShopApiConfig.getApiKey()))
+                : GlobalUtil.getConfig(brand, oneShopApiConfig.getApiKey()));
+        serviceConfig.setMarket(GlobalUtil.getConfig(brand, oneShopApiConfig.getMarket()));
+        serviceConfig.setEcpType(GlobalUtil.getConfig(brand, oneShopApiConfig.getEcpType()));
+        serviceConfig.setHttpMethod(METHOD_GET);
+        serviceConfig.setServiceUrl(GlobalUtil.getConfig(brand, oneShopApiConfig.getServiceUrl()));
+
+        return serviceConfig;
+    }
+
+    /**
+     * This method will get breadcrumb json
+     *
+     * @param ancestorCategories
+     * @param resovler
+     *
+     * @return breadcrumb json
+     */
+    private List<Map<String, String>> getBreadcrumbJson(final List<String> ancestorCategories,
+            final ResourceResolver resolver, final String brand) {
+
+        final JsonObject categoryMapping = new JsonParser().parse(getCategoryJsonMapping(resolver, brand))
+                .getAsJsonObject();
+        final List<Map<String, String>> breadcrumbList = new ArrayList<>();
+        for (final String category : ancestorCategories) {
+            String pagePath = StringUtils.EMPTY;
+            if (categoryMapping.has(category)) {
+                pagePath = categoryMapping.get(category).getAsJsonObject().get(Constants.CATEGORY_PAGE_PATH)
+                        .getAsString();
+            }
+            String title = StringUtils.EMPTY;
+            final Resource resource = resolver.getResource(pagePath + "/" + JcrConstants.JCR_CONTENT);
+            if (resource != null) {
+                final ValueMap valueMap = resource.adaptTo(ValueMap.class);
+                if (valueMap.containsKey(Constants.PAGE_TITLE)) {
+                    title = valueMap.get(Constants.PAGE_TITLE, String.class);
+                } else if (valueMap.containsKey(Constants.NAV_TITLE)) {
+                    title = valueMap.get(Constants.NAV_TITLE, String.class);
+                } else {
+                    title = valueMap.get(JcrConstants.JCR_TITLE, String.class);
+                }
+            }
+            final Map<String, String> categoryMap = new HashMap<>();
+            categoryMap.put(Constants.ID, category);
+            categoryMap.put(Constants.PAGE_PATH, pagePath);
+            categoryMap.put(Constants.NAME, title);
+            breadcrumbList.add(categoryMap);
+        }
+        return breadcrumbList;
+    }
+
+    /**
+     * @throws CryptoException
+     * @throws GenericException
+     */
+    private JsonObject getCategoriesFromOneShop(final String brand) throws CryptoException, GenericException {
+
+        final RestServiceConfiguration serviceConfig = getServiceConfig(brand);
+        serviceConfig.setServiceEndpoint(GlobalUtil.getConfig(brand, oneShopApiConfig.getcategoryApiEndPoint()));
+        final RestServiceRequest request = new RestServiceRequest(serviceConfig);
+        return oneShopService.executeOneShopGetRequest(request, brand);
+    }
+
+    /**
+     * This method will set the product listing API response.
+     *
+     * @param dealerCode
+     * @param serviceResponse
+     * @return
+     * @throws GenericException
+     */
+    private ProductListingApiResponse setProductListingResponse(final String dealerCode,
+            final JsonObject serviceResponse, final String brand) throws GenericException {
+
+        LOG.debug("Inside setProductListingResponse method");
+        final ProductListingApiResponse productListingApiResponse = new ProductListingApiResponse();
+        if (ObjectUtils.isNotEmpty(serviceResponse) && (serviceResponse.size() > ZERO)) {
+            final ProductListingApiStatusResponse productListingApiStatusResponse = new ProductListingApiStatusResponse();
+            productListingApiStatusResponse.setCode(SC_OK);
+            productListingApiStatusResponse.setMessage(SUCCESS_MSG);
+            final int totalCount = JsonUtil.getIntValueFromJson(serviceResponse, JsonPathQuery.PRODUCT_COUNT.query());
+            productListingApiStatusResponse.setTotalCount(totalCount);
+            productListingApiResponse.setStatus(productListingApiStatusResponse);
+            final List<ProductDetails> productCardList = new ArrayList<>();
+            final JsonArray results = serviceResponse.getAsJsonArray(RESULTS);
+            for (final JsonElement element : results) {
+                final JsonObject productJson = element.getAsJsonObject();
+                final ProductDetails productCard = new ProductDetails();
+                if (ObjectUtils.isNotEmpty(productJson)) {
+                    setProductDetails(productJson, productCard);
+                    oneShopService.setDealerPrice(dealerCode, brand, productCard);
+                    oneShopService.setProductVariants(dealerCode, productCard, serviceResponse, brand);
+                    if (CollectionUtils.isNotEmpty(productCard.getVariants())) {
+                        oneShopService.setPriceRangeProdDetailsForMasterVariant(productCard);
+                    }
+                    productCard.setCentAmount(null);
+                    productCard.setStrikeoutCentAmount(null);
+                    productCardList.add(productCard);
+                }
+            }
+            productListingApiResponse.setProduct(productCardList);
+        }
+        LOG.debug("Exiting setProductListingResponse method");
+        return productListingApiResponse;
+    }
+}
