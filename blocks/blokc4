@@ -535,7 +535,7 @@ public class Test2ServiceImpl implements Test2Service {
      * @throws CryptoException
      * @throws GenericException
      */
-    private void setDealerDetails(final Map<String, String> orderEmailParams, final String dealerKey,
+    public void setDealerDetails(final Map<String, String> orderEmailParams, final String dealerKey,
             final String brand) throws CryptoException, GenericException {
 
         LOG.debug("Inside setDealerDetails method");
@@ -572,7 +572,7 @@ public class Test2ServiceImpl implements Test2Service {
      *
      * @param productCard
      */
-    private void setLtoPriceRangeProdDetailsForMasterVariant(final ProductDetails productCard) {
+    public void setLtoPriceRangeProdDetailsForMasterVariant(final ProductDetails productCard) {
 
         LOG.debug("inside setLtoPriceRangeProdDetailsForMasterVariant method");
         final List<ProductDetails> variants = productCard.getVariants();
@@ -612,7 +612,7 @@ public class Test2ServiceImpl implements Test2Service {
      * @param productCard
      * @param productVariantCard
      */
-    private void setMaxMinAmountForLTO(final ProductDetails productCard, final ProductDetails productVariantCard,
+    public void setMaxMinAmountForLTO(final ProductDetails productCard, final ProductDetails productVariantCard,
             int minStrikeout, int maxStrikeout) {
 
         LOG.debug("inside setMaxMinAmountForLTO method");
@@ -636,7 +636,7 @@ public class Test2ServiceImpl implements Test2Service {
      * @param productCard
      * @param productVariantCard
      */
-    private void setMaxMinPriceForVariant(final ProductDetails productCard, final ProductDetails productVariantCard,
+    public void setMaxMinPriceForVariant(final ProductDetails productCard, final ProductDetails productVariantCard,
             int min, int max) {
 
         LOG.debug("inside setMaxMinPriceForVariant method");
@@ -683,7 +683,7 @@ public class Test2ServiceImpl implements Test2Service {
      *
      * @param productCard
      */
-    private void setStrikeoutPriceRangeForParentLevel(final ProductDetails productCard,
+    public void setStrikeoutPriceRangeForParentLevel(final ProductDetails productCard,
             final HashMap<String, Object> prices) {
 
         LOG.debug("inside setStrikeoutPriceRangeForParentLevel method");
@@ -710,7 +710,7 @@ public class Test2ServiceImpl implements Test2Service {
      * @param variantsResponse
      * @throws GenericException
      */
-    private void setVariantInformation(final String dealerCode, final ProductDetails productCard,
+    public void setVariantInformation(final String dealerCode, final ProductDetails productCard,
             final JsonObject serviceResponse, final HashMap<String, Object> prices, final StringBuilder stringBuilder,
             final List<String> typeKeyList, final JsonObject variantsResponse, final String brand)
             throws GenericException {
